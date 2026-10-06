@@ -21,11 +21,18 @@ SMEXT_LINK(&g_OTel);
 
 SH_DECL_HOOK1_void(IServerGameDLL, GameFrame, SH_NOATTRIB, 0, bool);
 
+// IPluginFunction::Execute / Invoke are the public entry points into plugin code.
+// Invoke(args) is overloaded, so these are manual hooks reconfigured with the
+// vtable index of the SM headers we are built against.
+SH_DECL_MANUALHOOK1(IPF_Execute, 0, 0, 0, int, cell_t *);
+SH_DECL_MANUALHOOK1(IPF_Invoke, 0, 0, 0, bool, cell_t *);
+SH_DECL_MANUALHOOK2(IPF_InvokeArgs, 0, 0, 0, bool, const sp::CallArgs &, cell_t *);
+
 CGlobalVars *gpGlobals = nullptr;
 ICvar *g_pCVar = nullptr;
 
 ConVar *g_cvEnable = CreateConVar("sm_otel_enable", "1", FCVAR_NOTIFY, "Master switch: frame metrics, profiling and export.", true, 0.0f, true, 1.0f);
-ConVar *g_cvProfile = CreateConVar("sm_otel_profile", "1", FCVAR_NOTIFY, "Profile every SourcePawn callback (per plugin / function timings). Slightly raises CPU use.", true, 0.0f, true, 1.0f);
+ConVar *g_cvProfile = CreateConVar("sm_otel_profile", "1", FCVAR_NOTIFY, "Time every SourcePawn callback (per plugin / function). Costs a few hundred ns per call.", true, 0.0f, true, 1.0f);
 ConVar *g_cvEndpoint = CreateConVar("sm_otel_endpoint", "http://127.0.0.1:4318", FCVAR_NONE, "OTLP/HTTP endpoint of the local collector (plain http:// only).");
 ConVar *g_cvService = CreateConVar("sm_otel_service_name", "srcds", FCVAR_NOTIFY, "OpenTelemetry service.name.");
 ConVar *g_cvEnvironment = CreateConVar("sm_otel_environment", "production", FCVAR_NOTIFY, "OpenTelemetry deployment.environment.name.");
@@ -69,31 +76,6 @@ bool OTelExt::RegisterConCommandBase(ConCommandBase *pVar)
 	return META_REGCVAR(pVar);
 }
 
-bool OTelExt::AcquireSourcePawn()
-{
-	char path[512];
-	g_pSM->BuildPath(Path_SM, path, sizeof(path), "bin/" PLATFORM_ARCH_FOLDER "sourcepawn.jit.x86." PLATFORM_LIB_EXT);
-
-	char err[255];
-	m_SpLib.reset(libsys->OpenLibrary(path, err, sizeof(err)));
-	if (!m_SpLib) {
-		smutils->LogError(myself, "Failed to open SourcePawn library %s: %s", path, err);
-		return false;
-	}
-
-	auto factoryFn = (SourcePawn::GetSourcePawnFactoryFn)m_SpLib->GetSymbolAddress("GetSourcePawnFactory");
-	SourcePawn::ISourcePawnFactory *factory = factoryFn ? factoryFn(0x0207) : nullptr;
-	SourcePawn::ISourcePawnEnvironment *env = factory ? factory->CurrentEnvironment() : nullptr;
-	m_Engine2 = env ? env->APIv2() : nullptr;
-	if (!m_Engine2) {
-		smutils->LogError(myself, "SourcePawn environment unavailable: callback profiling is disabled.");
-		return false;
-	}
-
-	m_SpVersion = m_Engine2->GetVersionString();
-	return true;
-}
-
 bool OTelExt::SDK_OnLoad(char *error, size_t maxlen, bool late)
 {
 	m_Profiler.BindThread();
@@ -105,13 +87,33 @@ bool OTelExt::SDK_OnLoad(char *error, size_t maxlen, bool late)
 		return false;
 	}
 
-	AcquireSourcePawn();
+	SourceHook::MemFuncInfo mfi = {true, -1, 0, 0};
+	SourceHook::GetFuncInfo(static_cast<int (SourcePawn::IPluginFunction::*)(cell_t *)>(&SourcePawn::IPluginFunction::Execute), mfi);
+	SH_MANUALHOOK_RECONFIGURE(IPF_Execute, mfi.vtblindex, mfi.vtbloffs, mfi.thisptroffs);
+	SourceHook::GetFuncInfo(static_cast<bool (SourcePawn::IPluginFunction::*)(cell_t *)>(&SourcePawn::IPluginFunction::Invoke), mfi);
+	SH_MANUALHOOK_RECONFIGURE(IPF_Invoke, mfi.vtblindex, mfi.vtbloffs, mfi.thisptroffs);
+	SourceHook::GetFuncInfo(static_cast<bool (SourcePawn::IPluginFunction::*)(const sp::CallArgs &, cell_t *)>(&SourcePawn::IPluginFunction::Invoke), mfi);
+	SH_MANUALHOOK_RECONFIGURE(IPF_InvokeArgs, mfi.vtblindex, mfi.vtbloffs, mfi.thisptroffs);
 
 	SH_ADD_HOOK(IServerGameDLL, GameFrame, gamedll, SH_MEMBER(this, &OTelExt::Hook_GameFramePre), false);
 	SH_ADD_HOOK(IServerGameDLL, GameFrame, gamedll, SH_MEMBER(this, &OTelExt::Hook_GameFramePost), true);
 
+	plsys->AddPluginsListener(this);
+
 	AutoExecConfig(g_pCVar, true);
 	return true;
+}
+
+void OTelExt::SDK_OnAllLoaded()
+{
+	// Late load: plugins are already running, grab a function to hook right away.
+	SourceMod::IPluginIterator *iter = plsys->GetPluginIterator();
+	for (; iter->MorePlugins() && !m_HookedFn; iter->NextPlugin()) {
+		SourceMod::IPlugin *pl = iter->GetPlugin();
+		if (pl->GetStatus() == SourceMod::Plugin_Running)
+			TryInstallHooks(pl->GetRuntime());
+	}
+	iter->Release();
 }
 
 void OTelExt::SDK_OnUnload()
@@ -119,40 +121,120 @@ void OTelExt::SDK_OnUnload()
 	SH_REMOVE_HOOK(IServerGameDLL, GameFrame, gamedll, SH_MEMBER(this, &OTelExt::Hook_GameFramePre), false);
 	SH_REMOVE_HOOK(IServerGameDLL, GameFrame, gamedll, SH_MEMBER(this, &OTelExt::Hook_GameFramePost), true);
 
-	SyncProfiler(false);
+	plsys->RemovePluginsListener(this);
+	RemoveHooks();
 	m_Exporter.Stop();
-	m_Engine2 = nullptr;
-	m_SpLib.reset();
 
 	ConVar_Unregister();
 }
 
-void OTelExt::SyncProfiler(bool want)
+bool OTelExt::TryInstallHooks(SourcePawn::IPluginRuntime *runtime)
 {
-	if (!m_Engine2 || want == m_Attached)
+	if (m_HookedFn || !runtime)
+		return m_HookedFn != nullptr;
+
+	// Public function ids are (index << 1) | 1; the first out-of-range id yields null.
+	SourcePawn::IPluginFunction *fn = nullptr;
+	for (unsigned i = 0; i < 64 && !fn; i++)
+		fn = runtime->GetFunctionById((i << 1) | 1);
+	if (!fn)
+		return false;
+
+	SH_ADD_MANUALHOOK(IPF_Execute, fn, SH_MEMBER(this, &OTelExt::Hook_ExecutePre), false);
+	SH_ADD_MANUALHOOK(IPF_Execute, fn, SH_MEMBER(this, &OTelExt::Hook_ExecutePost), true);
+	SH_ADD_MANUALHOOK(IPF_Invoke, fn, SH_MEMBER(this, &OTelExt::Hook_InvokePre), false);
+	SH_ADD_MANUALHOOK(IPF_Invoke, fn, SH_MEMBER(this, &OTelExt::Hook_InvokePost), true);
+	SH_ADD_MANUALHOOK(IPF_InvokeArgs, fn, SH_MEMBER(this, &OTelExt::Hook_InvokeArgsPre), false);
+	SH_ADD_MANUALHOOK(IPF_InvokeArgs, fn, SH_MEMBER(this, &OTelExt::Hook_InvokeArgsPost), true);
+	m_HookedFn = fn;
+	return true;
+}
+
+void OTelExt::RemoveHooks()
+{
+	if (!m_HookedFn)
 		return;
 
-	if (want) {
-		m_Profiler.ResetStack();
-		m_Engine2->SetProfilingTool(&m_Profiler);
-		m_Engine2->EnableProfiling();
-	} else {
-		m_Engine2->DisableProfiling();
-		m_Engine2->SetProfilingTool(nullptr);
-		m_Profiler.ResetStack();
-	}
-	m_Attached = want;
+	SourcePawn::IPluginFunction *fn = m_HookedFn;
+	m_HookedFn = nullptr;
+	m_ProfileOn = false;
+
+	SH_REMOVE_MANUALHOOK(IPF_Execute, fn, SH_MEMBER(this, &OTelExt::Hook_ExecutePre), false);
+	SH_REMOVE_MANUALHOOK(IPF_Execute, fn, SH_MEMBER(this, &OTelExt::Hook_ExecutePost), true);
+	SH_REMOVE_MANUALHOOK(IPF_Invoke, fn, SH_MEMBER(this, &OTelExt::Hook_InvokePre), false);
+	SH_REMOVE_MANUALHOOK(IPF_Invoke, fn, SH_MEMBER(this, &OTelExt::Hook_InvokePost), true);
+	SH_REMOVE_MANUALHOOK(IPF_InvokeArgs, fn, SH_MEMBER(this, &OTelExt::Hook_InvokeArgsPre), false);
+	SH_REMOVE_MANUALHOOK(IPF_InvokeArgs, fn, SH_MEMBER(this, &OTelExt::Hook_InvokeArgsPost), true);
+	m_Profiler.ResetStack();
+}
+
+void OTelExt::OnPluginLoaded(SourceMod::IPlugin *plugin)
+{
+	if (!m_HookedFn)
+		TryInstallHooks(plugin->GetRuntime());
+}
+
+void OTelExt::OnPluginUnloaded(SourceMod::IPlugin *plugin)
+{
+	m_Profiler.ClearFnCache();
+}
+
+void OTelExt::OnPluginDestroyed(SourceMod::IPlugin *plugin)
+{
+	m_Profiler.ClearFnCache();
+}
+
+// All six handlers do the same thing; the pre/post pair brackets one plugin call.
+int OTelExt::Hook_ExecutePre(cell_t *result)
+{
+	if (m_ProfileOn)
+		m_Profiler.Enter(META_IFACEPTR(SourcePawn::IPluginFunction));
+	RETURN_META_VALUE(MRES_IGNORED, 0);
+}
+
+int OTelExt::Hook_ExecutePost(cell_t *result)
+{
+	if (m_ProfileOn)
+		m_Profiler.Leave();
+	RETURN_META_VALUE(MRES_IGNORED, 0);
+}
+
+bool OTelExt::Hook_InvokePre(cell_t *result)
+{
+	if (m_ProfileOn)
+		m_Profiler.Enter(META_IFACEPTR(SourcePawn::IPluginFunction));
+	RETURN_META_VALUE(MRES_IGNORED, false);
+}
+
+bool OTelExt::Hook_InvokePost(cell_t *result)
+{
+	if (m_ProfileOn)
+		m_Profiler.Leave();
+	RETURN_META_VALUE(MRES_IGNORED, false);
+}
+
+bool OTelExt::Hook_InvokeArgsPre(const sp::CallArgs &args, cell_t *result)
+{
+	if (m_ProfileOn)
+		m_Profiler.Enter(META_IFACEPTR(SourcePawn::IPluginFunction));
+	RETURN_META_VALUE(MRES_IGNORED, false);
+}
+
+bool OTelExt::Hook_InvokeArgsPost(const sp::CallArgs &args, cell_t *result)
+{
+	if (m_ProfileOn)
+		m_Profiler.Leave();
+	RETURN_META_VALUE(MRES_IGNORED, false);
 }
 
 void OTelExt::Hook_GameFramePre(bool simulating)
 {
+	// Frame start is the only place scopes cannot be open, so the switch is safe here.
+	m_ProfileOn = g_cvEnable->GetBool() && g_cvProfile->GetBool() && m_HookedFn;
 	if (!g_cvEnable->GetBool()) {
-		SyncProfiler(false);
 		m_FrameProfiled = false;
 		RETURN_META(MRES_IGNORED);
 	}
-
-	SyncProfiler(g_cvProfile->GetBool());
 
 	m_FrameStartNs = NowNs();
 	m_FrameWallNs = WallNs();
@@ -165,7 +247,7 @@ void OTelExt::Hook_GameFramePre(bool simulating)
 	}
 	m_PrevFrameStartNs = m_FrameStartNs;
 
-	m_FrameProfiled = m_Attached;
+	m_FrameProfiled = m_ProfileOn;
 	if (m_FrameProfiled)
 		m_Profiler.BeginFrame();
 
@@ -222,8 +304,7 @@ Attrs OTelExt::BuildResource()
 	 .Str("deployment.environment.name", g_cvEnvironment->GetString())
 	 .Str("server.hostname", g_pHostname ? g_pHostname->GetString() : "")
 	 .Int("server.port", port)
-	 .Str("game.mod", smutils->GetGameFolderName())
-	 .Str("sourcepawn.version", m_SpVersion.c_str());
+	 .Str("game.mod", smutils->GetGameFolderName());
 	return a;
 }
 
@@ -290,14 +371,6 @@ void OTelExt::Flush(uint64_t nowNs)
 	else if (lastError.empty() && m_ExporterWasFailing)
 		smutils->LogMessage(myself, "Export recovered.");
 	m_ExporterWasFailing = !lastError.empty();
-
-	// Something else (e.g. "sm prof") replaced our tool: take the VM back.
-	if (m_Attached && m_Profiler.ScopeCount() == m_ScopesAtFlush && playerhelpers->GetNumPlayers() > 0) {
-		m_Attached = false;
-		SyncProfiler(true);
-		smutils->LogMessage(myself, "No profiling scope seen since the last export, re-attached to the VM.");
-	}
-	m_ScopesAtFlush = m_Profiler.ScopeCount();
 
 	uint64_t wallNow = WallNs();
 	MetricsDoc doc(BuildResource(), SMEXT_CONF_VERSION, m_StartWallNs, wallNow);
@@ -426,10 +499,10 @@ void OTelExt::Flush(uint64_t nowNs)
 void OTelExt::PrintStatus()
 {
 	META_CONPRINTF("sm-ext-otel %s\n", SMEXT_CONF_VERSION);
-	META_CONPRINTF("  enabled=%d profile=%d profiler %s (SourcePawn %s)\n", g_cvEnable->GetInt(), g_cvProfile->GetInt(),
-		m_Attached ? "attached" : "detached", m_SpVersion.empty() ? "unknown" : m_SpVersion.c_str());
+	META_CONPRINTF("  enabled=%d profile=%d, plugin call hooks %s, profiling %s\n", g_cvEnable->GetInt(), g_cvProfile->GetInt(),
+		m_HookedFn ? "installed" : "NOT installed (no plugin loaded yet)", m_ProfileOn ? "on" : "off");
 	META_CONPRINTF("  endpoint %s, service '%s', every %ds\n", Endpoint().c_str(), g_cvService->GetString(), g_cvInterval->GetInt());
-	META_CONPRINTF("  callbacks tracked: %zu (exporting %zu), scopes seen: %" PRIu64 "\n",
+	META_CONPRINTF("  callbacks tracked: %zu (exporting %zu), calls timed: %" PRIu64 "\n",
 		m_Profiler.Stats().size(), m_FlushedSeries, m_Profiler.ScopeCount());
 	META_CONPRINTF("  frames: %" PRIu64 ", slow: %" PRIu64 " (> %d ms), traces sent: %" PRIu64 ", rate-limited: %" PRIu64 "\n",
 		m_FrameStat.calls, m_SlowFrames, g_cvSlowMs->GetInt(), m_TracesSent, m_SlowSuppressed);

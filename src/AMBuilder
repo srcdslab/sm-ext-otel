@@ -22,6 +22,11 @@ for sdk_name in Extension.sdks:
 
         binary = Extension.HL2ExtConfig(project, builder, cxx, projectName + '.ext.' + sdk['extension'], sdk)
 
+        # Silence fatal errors on warning flags unknown to older Clang (local clang 18)
+        if cxx.family in ['gcc', 'clang']:
+            binary.compiler.cflags += ['-Wno-unknown-warning-option']
+            binary.compiler.cxxflags += ['-Wno-unknown-warning-option']
+
         if cxx.target.platform == 'windows':
             binary.compiler.postlink += ['ws2_32.lib']
 

@@ -69,12 +69,13 @@ struct Span
 std::string PluginLabel(const char *path, size_t len);
 
 /**
- * SourcePawn profiling tool. SourcePawn calls EnterScope/LeaveScope around every
- * public function it executes (forwards, timers, hooks, commands, SQL callbacks...);
- * the scope name is "plugin.smx::Function". Everything runs on the main thread, so
- * the aggregation needs no lock; scopes entered from other threads are ignored.
+ * Times every public SourcePawn function the host runs (forwards, timers, hooks,
+ * commands, SQL callbacks...). The extension hooks IPluginFunction::Execute/Invoke
+ * and brackets each call with Enter()/Leave(); a callback is named
+ * "plugin.smx::Function" (IPluginFunction::DebugName). Everything runs on the main
+ * thread, so the aggregation needs no lock; calls from other threads are ignored.
  */
-class Profiler : public SourcePawn::IProfilingTool
+class Profiler
 {
 public:
 	static constexpr size_t kMaxStats = 4096;
@@ -83,22 +84,13 @@ public:
 	// The extension is loaded on the game thread: only that thread is profiled.
 	void BindThread() { m_Main = std::this_thread::get_id(); }
 
-	// IProfilingTool
-	const char *Name() override { return "otel"; }
-	const char *Description() override { return "OpenTelemetry exporter (sm-ext-otel)"; }
-	void RenderHelp(void (*render)(const char *fmt, ...)) override
-	{
-		render("sm-ext-otel profiles continuously; see sm_otel_status / sm_otel_top.");
-	}
-	bool Start() override { return false; }
-	void Stop(void (*render)(const char *fmt, ...)) override {}
-	void Dump() override {}
-	bool IsActive() override { return true; }
-	bool IsAttached() override { return true; }
-	void EnterScope(const char *group, const char *name) override;
-	void LeaveScope() override;
+	void Enter(SourcePawn::IPluginFunction *fn);
+	void Leave();
 
-	// Called when the tool is (re)attached or detached from the VM.
+	// Function pointers are only valid while their plugin is loaded.
+	void ClearFnCache() { m_FnCache.clear(); }
+
+	// Drops scopes left open (hooks removed mid-call).
 	void ResetStack() { m_Stack.clear(); }
 
 	void BeginFrame();
@@ -113,6 +105,8 @@ public:
 private:
 	struct Frame
 	{
+		SourcePawn::IPluginFunction *fn;
+		bool dup; // Execute() -> Invoke() -> Invoke(args) chain: only the outermost call counts
 		Stat *stat;
 		uint64_t start;
 		uint64_t child;
@@ -121,11 +115,12 @@ private:
 	};
 
 	Stat *Lookup(const char *name);
+	Stat *Resolve(SourcePawn::IPluginFunction *fn);
 
 	std::thread::id m_Main;
 	std::vector<Frame> m_Stack;
 	std::unordered_map<std::string, std::unique_ptr<Stat>> m_Stats;
-	std::unordered_map<const char *, Stat *> m_PtrCache; // DebugName() pointers are stable per function
+	std::unordered_map<SourcePawn::IPluginFunction *, Stat *> m_FnCache;
 	std::vector<Span> m_Spans;
 	bool m_FrameActive = false;
 	bool m_SpansTruncated = false;

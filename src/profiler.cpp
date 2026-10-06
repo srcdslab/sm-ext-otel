@@ -24,35 +24,36 @@ std::string PluginLabel(const char *path, size_t len)
 
 Stat *Profiler::Lookup(const char *name)
 {
-	auto cached = m_PtrCache.find(name);
-	if (cached != m_PtrCache.end() && strcmp(cached->second->name.c_str(), name) == 0)
-		return cached->second;
-
-	Stat *stat;
 	auto it = m_Stats.find(name);
-	if (it != m_Stats.end()) {
-		stat = it->second.get();
+	if (it != m_Stats.end())
+		return it->second.get();
+
+	if (m_Stats.size() >= kMaxStats)
+		return nullptr;
+
+	auto created = std::make_unique<Stat>();
+	created->name = name;
+	const char *sep = strstr(name, "::");
+	if (sep) {
+		created->plugin = PluginLabel(name, sep - name);
+		created->func = sep + 2;
 	} else {
-		if (m_Stats.size() >= kMaxStats)
-			return nullptr;
-
-		auto created = std::make_unique<Stat>();
-		created->name = name;
-		const char *sep = strstr(name, "::");
-		if (sep) {
-			created->plugin = PluginLabel(name, sep - name);
-			created->func = sep + 2;
-		} else {
-			created->func = name; // event from a plugin's own Profiler natives
-		}
-		stat = created.get();
-		m_Stats.emplace(created->name, std::move(created));
+		created->func = name;
 	}
+	Stat *stat = created.get();
+	m_Stats.emplace(created->name, std::move(created));
+	return stat;
+}
 
-	// Plugins can be reloaded at a different address: don't let the cache grow forever.
-	if (m_PtrCache.size() > 16384)
-		m_PtrCache.clear();
-	m_PtrCache[name] = stat;
+Stat *Profiler::Resolve(SourcePawn::IPluginFunction *fn)
+{
+	auto it = m_FnCache.find(fn);
+	if (it != m_FnCache.end())
+		return it->second;
+
+	const char *name = fn->DebugName();
+	Stat *stat = name ? Lookup(name) : nullptr;
+	m_FnCache[fn] = stat;
 	return stat;
 }
 
@@ -64,20 +65,27 @@ void Profiler::BeginFrame()
 	m_FrameStart = NowNs();
 }
 
-void Profiler::EnterScope(const char *group, const char *name)
+void Profiler::Enter(SourcePawn::IPluginFunction *fn)
 {
 	if (std::this_thread::get_id() != m_Main)
 		return;
 
 	Frame f;
+	f.fn = fn;
+	f.dup = false;
 	f.stat = nullptr;
 	f.child = 0;
 	f.span = -1;
 	f.parentSpan = -1;
 
-	// "EnterJIT" wraps every call; it only measures VM entry overhead.
-	if (name && strcmp(name, "EnterJIT") != 0)
-		f.stat = Lookup(name);
+	if (!m_Stack.empty() && m_Stack.back().fn == fn) {
+		f.dup = true;
+		f.start = 0;
+		m_Stack.push_back(f);
+		return;
+	}
+
+	f.stat = Resolve(fn);
 
 	if (!m_Stack.empty()) {
 		const Frame &p = m_Stack.back();
@@ -100,7 +108,7 @@ void Profiler::EnterScope(const char *group, const char *name)
 	m_Stack.push_back(f);
 }
 
-void Profiler::LeaveScope()
+void Profiler::Leave()
 {
 	if (std::this_thread::get_id() != m_Main)
 		return;
@@ -110,6 +118,8 @@ void Profiler::LeaveScope()
 	uint64_t end = NowNs();
 	Frame f = m_Stack.back();
 	m_Stack.pop_back();
+	if (f.dup)
+		return;
 
 	uint64_t dur = end - f.start;
 	if (!m_Stack.empty())

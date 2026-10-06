@@ -7,6 +7,11 @@
  */
 
 #include "smsdk_ext.h"
+
+// sp::CallArgs, and the Invoke(args) entry point that takes it, exist from extension API 9
+// (SM 1.13). Older SM (1.12) only has Execute / Invoke(result).
+#define OTEL_HAS_INVOKE_ARGS (SMINTERFACE_EXTENSIONAPI_VERSION >= 9)
+
 #include "exporter.h"
 #include "otlp.h"
 #include "profiler.h"
@@ -39,8 +44,10 @@ public: // SourceHook
 	int Hook_ExecutePost(cell_t *result);
 	bool Hook_InvokePre(cell_t *result);
 	bool Hook_InvokePost(cell_t *result);
+#if OTEL_HAS_INVOKE_ARGS
 	bool Hook_InvokeArgsPre(const sp::CallArgs &args, cell_t *result);
 	bool Hook_InvokeArgsPost(const sp::CallArgs &args, cell_t *result);
+#endif
 
 public: // console
 	void PrintStatus();

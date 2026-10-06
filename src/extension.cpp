@@ -28,7 +28,9 @@ SH_DECL_HOOK1_void(IServerGameDLL, GameFrame, SH_NOATTRIB, 0, bool);
 // (vtable) hooks: SourceHook's default hooks only cover the one instance given.
 SH_DECL_MANUALHOOK1(IPF_Execute, 0, 0, 0, int, cell_t *);
 SH_DECL_MANUALHOOK1(IPF_Invoke, 0, 0, 0, bool, cell_t *);
+#if OTEL_HAS_INVOKE_ARGS
 SH_DECL_MANUALHOOK2(IPF_InvokeArgs, 0, 0, 0, bool, const sp::CallArgs &, cell_t *);
+#endif
 
 CGlobalVars *gpGlobals = nullptr;
 ICvar *g_pCVar = nullptr;
@@ -94,9 +96,11 @@ bool OTelExt::SDK_OnLoad(char *error, size_t maxlen, bool late)
 	SourceHook::GetFuncInfo(static_cast<bool (SourcePawn::IPluginFunction::*)(cell_t *)>(&SourcePawn::IPluginFunction::Invoke), mfi);
 	SH_MANUALHOOK_RECONFIGURE(IPF_Invoke, mfi.vtblindex, mfi.vtbloffs, mfi.thisptroffs);
 	m_VtblIdx[1] = mfi.vtblindex;
+#if OTEL_HAS_INVOKE_ARGS
 	SourceHook::GetFuncInfo(static_cast<bool (SourcePawn::IPluginFunction::*)(const sp::CallArgs &, cell_t *)>(&SourcePawn::IPluginFunction::Invoke), mfi);
 	SH_MANUALHOOK_RECONFIGURE(IPF_InvokeArgs, mfi.vtblindex, mfi.vtbloffs, mfi.thisptroffs);
 	m_VtblIdx[2] = mfi.vtblindex;
+#endif
 
 	SH_ADD_HOOK(IServerGameDLL, GameFrame, gamedll, SH_MEMBER(this, &OTelExt::Hook_GameFramePre), false);
 	SH_ADD_HOOK(IServerGameDLL, GameFrame, gamedll, SH_MEMBER(this, &OTelExt::Hook_GameFramePost), true);
@@ -148,8 +152,10 @@ bool OTelExt::TryInstallHooks(SourcePawn::IPluginRuntime *runtime)
 	SH_ADD_MANUALVPHOOK(IPF_Execute, fn, SH_MEMBER(this, &OTelExt::Hook_ExecutePost), true);
 	SH_ADD_MANUALVPHOOK(IPF_Invoke, fn, SH_MEMBER(this, &OTelExt::Hook_InvokePre), false);
 	SH_ADD_MANUALVPHOOK(IPF_Invoke, fn, SH_MEMBER(this, &OTelExt::Hook_InvokePost), true);
+#if OTEL_HAS_INVOKE_ARGS
 	SH_ADD_MANUALVPHOOK(IPF_InvokeArgs, fn, SH_MEMBER(this, &OTelExt::Hook_InvokeArgsPre), false);
 	SH_ADD_MANUALVPHOOK(IPF_InvokeArgs, fn, SH_MEMBER(this, &OTelExt::Hook_InvokeArgsPost), true);
+#endif
 	m_HookedFn = fn;
 	return true;
 }
@@ -167,8 +173,10 @@ void OTelExt::RemoveHooks()
 	SH_REMOVE_MANUALHOOK(IPF_Execute, fn, SH_MEMBER(this, &OTelExt::Hook_ExecutePost), true);
 	SH_REMOVE_MANUALHOOK(IPF_Invoke, fn, SH_MEMBER(this, &OTelExt::Hook_InvokePre), false);
 	SH_REMOVE_MANUALHOOK(IPF_Invoke, fn, SH_MEMBER(this, &OTelExt::Hook_InvokePost), true);
+#if OTEL_HAS_INVOKE_ARGS
 	SH_REMOVE_MANUALHOOK(IPF_InvokeArgs, fn, SH_MEMBER(this, &OTelExt::Hook_InvokeArgsPre), false);
 	SH_REMOVE_MANUALHOOK(IPF_InvokeArgs, fn, SH_MEMBER(this, &OTelExt::Hook_InvokeArgsPost), true);
+#endif
 	m_Profiler.ResetStack();
 }
 
@@ -219,6 +227,7 @@ bool OTelExt::Hook_InvokePost(cell_t *result)
 	RETURN_META_VALUE(MRES_IGNORED, false);
 }
 
+#if OTEL_HAS_INVOKE_ARGS
 bool OTelExt::Hook_InvokeArgsPre(const sp::CallArgs &args, cell_t *result)
 {
 	m_HookHits[2]++;
@@ -233,6 +242,7 @@ bool OTelExt::Hook_InvokeArgsPost(const sp::CallArgs &args, cell_t *result)
 		m_Profiler.Leave();
 	RETURN_META_VALUE(MRES_IGNORED, false);
 }
+#endif
 
 void OTelExt::Hook_GameFramePre(bool simulating)
 {

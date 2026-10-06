@@ -74,6 +74,10 @@ is de-duplicated. Calls made from other threads are ignored; aggregation runs on
 without locks. Switching profiling on/off only happens at the start of a frame, where no callback
 can be running.
 
+The extension targets SourceMod 1.13 (extension API 9 or newer). Against SM 1.12 it still builds, but
+without the `Invoke(args)` entry point (`sp::CallArgs` does not exist there), so that build misses calls
+and is only a compile check.
+
 Limits: natives are not separate spans (their time is inside the callback that called them), and the
 engine's own C++ time (networking, physics) is only visible as the difference between frame time and
 the sum of callbacks.

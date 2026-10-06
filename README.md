@@ -29,7 +29,7 @@ a plain `GameFrame` pre/post pair would miss. Traces are rate limited
 (`sm_otel_slow_max_per_min`).
 
 Resource attributes: `service.name`, `service.instance.id`, `deployment.environment.name`,
-`server.hostname`, `server.port`, `game.mod`.
+`server.port`, `game.mod`.
 
 ## Install
 

@@ -45,7 +45,6 @@ ConVar *g_cvSlowMaxPerMin = CreateConVar("sm_otel_slow_max_per_min", "12", FCVAR
 ConVar *g_cvMinSpanUs = CreateConVar("sm_otel_min_span_us", "100", FCVAR_NOTIFY, "Callbacks shorter than this (microseconds) are left out of slow-frame traces.", true, 0.0f, true, 100000.0f);
 ConVar *g_cvMaxSeries = CreateConVar("sm_otel_max_series", "500", FCVAR_NOTIFY, "Maximum callbacks (busiest first) exported as metric series.", true, 10.0f, true, 4096.0f);
 
-static ConVar *g_pHostname = nullptr;
 static ConVar *g_pHostport = nullptr;
 
 static void CmdStatus(const CCommand &args) { g_OTel.PrintStatus(); }
@@ -68,7 +67,6 @@ bool OTelExt::SDK_OnMetamodLoad(ISmmAPI *ismm, char *error, size_t maxlen, bool 
 	gpGlobals = ismm->GetCGlobals();
 	ConVar_Register(0, this);
 
-	g_pHostname = g_pCVar->FindVar("hostname");
 	g_pHostport = g_pCVar->FindVar("hostport");
 	return true;
 }
@@ -324,11 +322,12 @@ Attrs OTelExt::BuildResource()
 		instance = buf;
 	}
 
+	// No server hostname here on purpose: it carries Source colour codes (0x17/0x0f) and
+	// SigNoz returns empty values for every groupBy of a metric labelled with them.
 	Attrs a;
 	a.Str("service.name", service)
 	 .Str("service.instance.id", instance.c_str())
 	 .Str("deployment.environment.name", g_cvEnvironment->GetString())
-	 .Str("server.hostname", g_pHostname ? g_pHostname->GetString() : "")
 	 .Int("server.port", port)
 	 .Str("game.mod", smutils->GetGameFolderName());
 	return a;

@@ -1,5 +1,24 @@
 # sm-ext-otel
 
+## What is this, in plain words?
+
+**Counter-Strike: Source servers can feel laggy, and nobody knows why.** The server runs dozens of small programs called *plugins* (they add commands, votes, ranks, anti-cheat...). When the game stutters, you can't tell which plugin is the guilty one.
+
+**This project is a stopwatch for plugins.** It sits inside the server and times every job each plugin does, thousands of times per second, at almost no cost. Every few seconds it sends the numbers to a dashboard where you can see them as graphs.
+
+**What you get:**
+
+- *Which plugin uses the most time?* A ranking, updated live.
+- *Is the server keeping up?* The server works in "ticks" (66 per second). If one tick takes too long, players feel lag. You can see how long ticks take.
+- *What happened during a lag spike?* When a tick is too slow, the project saves a short report listing exactly which plugin functions ran during it.
+- *Is a plugin leaking memory?* A line that only goes up is a leak.
+
+Think of it as a fitness tracker for your game server: instead of "I feel tired", you get "my heart rate spikes every 4 seconds, right when this plugin runs".
+
+It does not change the game, it only watches. It costs about 0.1 to 0.16 microseconds per plugin call, and it sends its data to a local collector (OpenTelemetry), so any monitoring tool can read it (we use SigNoz).
+
+The rest of this page is the technical reference.
+
 APM-style monitoring for a SourceMod server, exported over OpenTelemetry (OTLP/HTTP JSON) to any
 backend that speaks OTLP (SigNoz, Grafana Tempo/Mimir, Datadog, ...) through a collector.
 

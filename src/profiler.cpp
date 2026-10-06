@@ -2,6 +2,14 @@
 
 #include <cstring>
 
+#ifdef _WIN32
+	#define WIN32_LEAN_AND_MEAN
+	#define NOMINMAX
+	#include <windows.h>
+#else
+	#include <time.h>
+#endif
+
 namespace otel {
 
 // 0.01 ms .. 250 ms
@@ -9,6 +17,24 @@ const uint64_t kBoundsNs[kNumBounds] = {
 	10000ULL, 50000ULL, 100000ULL, 250000ULL, 500000ULL, 1000000ULL, 2500000ULL,
 	5000000ULL, 10000000ULL, 25000000ULL, 50000000ULL, 100000000ULL, 250000000ULL
 };
+
+uint64_t ThreadCpuNs()
+{
+#ifdef _WIN32
+	FILETIME create, exit, kernel, user;
+	if (!GetThreadTimes(GetCurrentThread(), &create, &exit, &kernel, &user))
+		return 0;
+	ULARGE_INTEGER k, u;
+	k.LowPart = kernel.dwLowDateTime; k.HighPart = kernel.dwHighDateTime;
+	u.LowPart = user.dwLowDateTime; u.HighPart = user.dwHighDateTime;
+	return (k.QuadPart + u.QuadPart) * 100ULL; // 100 ns units
+#else
+	timespec ts;
+	if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0)
+		return 0;
+	return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+#endif
+}
 
 std::string PluginLabel(const char *path, size_t len)
 {

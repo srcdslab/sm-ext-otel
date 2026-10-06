@@ -50,7 +50,7 @@ private:
 	bool TryInstallHooks(SourcePawn::IPluginRuntime *runtime);
 	void RemoveHooks();
 	void Flush(uint64_t nowNs);
-	void EmitSlowTrace(uint64_t endNs, uint64_t durNs);
+	void EmitSlowTrace(uint64_t endNs, uint64_t gameFrameNs, uint64_t tickCpuNs);
 	otel::Attrs BuildResource();
 	std::string Endpoint();
 
@@ -60,24 +60,24 @@ private:
 
 	SourcePawn::IPluginFunction *m_HookedFn = nullptr; // any function: SourceHook patches the shared vtable
 	bool m_ProfileOn = false;  // toggled between frames only, so Enter/Leave stay paired
-	bool m_FrameProfiled = false;
+	uint64_t m_HookHits[3] = {0, 0, 0}; // Execute, Invoke, Invoke(args): diagnostics
+	int m_VtblIdx[3] = {-1, -1, -1};
 
 	otel::Stat m_FrameStat;
 	otel::Stat m_IntervalStat;
+	otel::Stat m_TickCpuStat;
+	uint64_t m_PrevPostCpuNs = 0;
 	uint64_t m_SlowFrames = 0;
 	uint64_t m_SlowSuppressed = 0;
 	uint64_t m_TracesSent = 0;
 
 	uint64_t m_StartWallNs = 0;
 	uint64_t m_FrameStartNs = 0;
-	uint64_t m_FrameWallNs = 0;
 	uint64_t m_PrevFrameStartNs = 0;
 	uint64_t m_NextFlushNs = 0;
 	uint64_t m_LastTraceNs = 0;
-	uint64_t m_LastFlushNs = 0;
 	size_t m_FlushedSeries = 0;
 	bool m_ExporterWasFailing = false;
-	uint64_t m_FailedAtFlush = 0;
 };
 
 extern OTelExt g_OTel;

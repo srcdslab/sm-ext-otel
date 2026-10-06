@@ -6,12 +6,13 @@
 #include <algorithm>
 #include <vector>
 
-#ifdef PLATFORM_LINUX
-	#include <sys/resource.h>
+#ifdef _WIN32
+	#include <windows.h>
+#else
 	#include <unistd.h>
-#endif
-#ifndef _WIN32
-	#include <unistd.h>
+	#ifdef PLATFORM_LINUX
+		#include <sys/resource.h>
+	#endif
 #endif
 
 using namespace otel;
@@ -23,7 +24,8 @@ SH_DECL_HOOK1_void(IServerGameDLL, GameFrame, SH_NOATTRIB, 0, bool);
 
 // IPluginFunction::Execute / Invoke are the public entry points into plugin code.
 // Invoke(args) is overloaded, so these are manual hooks reconfigured with the
-// vtable index of the SM headers we are built against.
+// vtable index of the SM headers we are built against. They are installed as VP
+// (vtable) hooks: SourceHook's default hooks only cover the one instance given.
 SH_DECL_MANUALHOOK1(IPF_Execute, 0, 0, 0, int, cell_t *);
 SH_DECL_MANUALHOOK1(IPF_Invoke, 0, 0, 0, bool, cell_t *);
 SH_DECL_MANUALHOOK2(IPF_InvokeArgs, 0, 0, 0, bool, const sp::CallArgs &, cell_t *);
@@ -90,10 +92,13 @@ bool OTelExt::SDK_OnLoad(char *error, size_t maxlen, bool late)
 	SourceHook::MemFuncInfo mfi = {true, -1, 0, 0};
 	SourceHook::GetFuncInfo(static_cast<int (SourcePawn::IPluginFunction::*)(cell_t *)>(&SourcePawn::IPluginFunction::Execute), mfi);
 	SH_MANUALHOOK_RECONFIGURE(IPF_Execute, mfi.vtblindex, mfi.vtbloffs, mfi.thisptroffs);
+	m_VtblIdx[0] = mfi.vtblindex;
 	SourceHook::GetFuncInfo(static_cast<bool (SourcePawn::IPluginFunction::*)(cell_t *)>(&SourcePawn::IPluginFunction::Invoke), mfi);
 	SH_MANUALHOOK_RECONFIGURE(IPF_Invoke, mfi.vtblindex, mfi.vtbloffs, mfi.thisptroffs);
+	m_VtblIdx[1] = mfi.vtblindex;
 	SourceHook::GetFuncInfo(static_cast<bool (SourcePawn::IPluginFunction::*)(const sp::CallArgs &, cell_t *)>(&SourcePawn::IPluginFunction::Invoke), mfi);
 	SH_MANUALHOOK_RECONFIGURE(IPF_InvokeArgs, mfi.vtblindex, mfi.vtbloffs, mfi.thisptroffs);
+	m_VtblIdx[2] = mfi.vtblindex;
 
 	SH_ADD_HOOK(IServerGameDLL, GameFrame, gamedll, SH_MEMBER(this, &OTelExt::Hook_GameFramePre), false);
 	SH_ADD_HOOK(IServerGameDLL, GameFrame, gamedll, SH_MEMBER(this, &OTelExt::Hook_GameFramePost), true);
@@ -140,12 +145,13 @@ bool OTelExt::TryInstallHooks(SourcePawn::IPluginRuntime *runtime)
 	if (!fn)
 		return false;
 
-	SH_ADD_MANUALHOOK(IPF_Execute, fn, SH_MEMBER(this, &OTelExt::Hook_ExecutePre), false);
-	SH_ADD_MANUALHOOK(IPF_Execute, fn, SH_MEMBER(this, &OTelExt::Hook_ExecutePost), true);
-	SH_ADD_MANUALHOOK(IPF_Invoke, fn, SH_MEMBER(this, &OTelExt::Hook_InvokePre), false);
-	SH_ADD_MANUALHOOK(IPF_Invoke, fn, SH_MEMBER(this, &OTelExt::Hook_InvokePost), true);
-	SH_ADD_MANUALHOOK(IPF_InvokeArgs, fn, SH_MEMBER(this, &OTelExt::Hook_InvokeArgsPre), false);
-	SH_ADD_MANUALHOOK(IPF_InvokeArgs, fn, SH_MEMBER(this, &OTelExt::Hook_InvokeArgsPost), true);
+	// Hook_VP: patch the shared vtable so every plugin function is covered, not just `fn`.
+	SH_ADD_MANUALVPHOOK(IPF_Execute, fn, SH_MEMBER(this, &OTelExt::Hook_ExecutePre), false);
+	SH_ADD_MANUALVPHOOK(IPF_Execute, fn, SH_MEMBER(this, &OTelExt::Hook_ExecutePost), true);
+	SH_ADD_MANUALVPHOOK(IPF_Invoke, fn, SH_MEMBER(this, &OTelExt::Hook_InvokePre), false);
+	SH_ADD_MANUALVPHOOK(IPF_Invoke, fn, SH_MEMBER(this, &OTelExt::Hook_InvokePost), true);
+	SH_ADD_MANUALVPHOOK(IPF_InvokeArgs, fn, SH_MEMBER(this, &OTelExt::Hook_InvokeArgsPre), false);
+	SH_ADD_MANUALVPHOOK(IPF_InvokeArgs, fn, SH_MEMBER(this, &OTelExt::Hook_InvokeArgsPost), true);
 	m_HookedFn = fn;
 	return true;
 }
@@ -187,6 +193,7 @@ void OTelExt::OnPluginDestroyed(SourceMod::IPlugin *plugin)
 // All six handlers do the same thing; the pre/post pair brackets one plugin call.
 int OTelExt::Hook_ExecutePre(cell_t *result)
 {
+	m_HookHits[0]++;
 	if (m_ProfileOn)
 		m_Profiler.Enter(META_IFACEPTR(SourcePawn::IPluginFunction));
 	RETURN_META_VALUE(MRES_IGNORED, 0);
@@ -201,6 +208,7 @@ int OTelExt::Hook_ExecutePost(cell_t *result)
 
 bool OTelExt::Hook_InvokePre(cell_t *result)
 {
+	m_HookHits[1]++;
 	if (m_ProfileOn)
 		m_Profiler.Enter(META_IFACEPTR(SourcePawn::IPluginFunction));
 	RETURN_META_VALUE(MRES_IGNORED, false);
@@ -215,6 +223,7 @@ bool OTelExt::Hook_InvokePost(cell_t *result)
 
 bool OTelExt::Hook_InvokeArgsPre(const sp::CallArgs &args, cell_t *result)
 {
+	m_HookHits[2]++;
 	if (m_ProfileOn)
 		m_Profiler.Enter(META_IFACEPTR(SourcePawn::IPluginFunction));
 	RETURN_META_VALUE(MRES_IGNORED, false);
@@ -232,12 +241,11 @@ void OTelExt::Hook_GameFramePre(bool simulating)
 	// Frame start is the only place scopes cannot be open, so the switch is safe here.
 	m_ProfileOn = g_cvEnable->GetBool() && g_cvProfile->GetBool() && m_HookedFn;
 	if (!g_cvEnable->GetBool()) {
-		m_FrameProfiled = false;
+		m_Profiler.EndFrame();
 		RETURN_META(MRES_IGNORED);
 	}
 
 	m_FrameStartNs = NowNs();
-	m_FrameWallNs = WallNs();
 
 	// Intervals above a second are the server waking up from hibernation, not a tick.
 	if (m_PrevFrameStartNs) {
@@ -247,9 +255,12 @@ void OTelExt::Hook_GameFramePre(bool simulating)
 	}
 	m_PrevFrameStartNs = m_FrameStartNs;
 
-	m_FrameProfiled = m_ProfileOn;
-	if (m_FrameProfiled)
+	// The span window is rolling (previous GameFrame post -> this post) so it also covers
+	// what SourceMod itself runs before our pre hook: timers, OnGameFrame, queued commands.
+	if (m_ProfileOn && !m_Profiler.FrameActive())
 		m_Profiler.BeginFrame();
+	else if (!m_ProfileOn)
+		m_Profiler.EndFrame();
 
 	RETURN_META(MRES_IGNORED);
 }
@@ -261,14 +272,26 @@ void OTelExt::Hook_GameFramePost(bool simulating)
 	}
 
 	uint64_t end = NowNs();
-	uint64_t dur = end - m_FrameStartNs;
-	m_Profiler.EndFrame();
-	m_FrameStat.Record(dur, dur);
+	uint64_t gameFrame = end - m_FrameStartNs;
+	m_FrameStat.Record(gameFrame, gameFrame);
 
-	if (dur >= (uint64_t)g_cvSlowMs->GetInt() * 1000000ULL) {
+	// Busy time of the main thread since the previous frame: sleeping excluded, SourceMod's
+	// own pre-frame work (timers, forwards) and the engine's work around GameFrame included.
+	uint64_t cpu = ThreadCpuNs();
+	uint64_t tickCpu = (m_PrevPostCpuNs && cpu > m_PrevPostCpuNs) ? cpu - m_PrevPostCpuNs : 0;
+	m_PrevPostCpuNs = cpu;
+	if (tickCpu)
+		m_TickCpuStat.Record(tickCpu, tickCpu);
+
+	uint64_t slowNs = (uint64_t)g_cvSlowMs->GetInt() * 1000000ULL;
+	if (std::max(gameFrame, tickCpu) >= slowNs) {
 		m_SlowFrames++;
-		EmitSlowTrace(end, dur);
+		EmitSlowTrace(end, gameFrame, tickCpu);
 	}
+
+	m_Profiler.EndFrame();
+	if (m_ProfileOn)
+		m_Profiler.BeginFrame();
 
 	if (end >= m_NextFlushNs)
 		Flush(end);
@@ -289,7 +312,10 @@ Attrs OTelExt::BuildResource()
 	std::string instance = g_cvInstance->GetString();
 	if (instance.empty()) {
 		char host[128] = "srcds";
-#ifndef PLATFORM_APPLE
+#ifdef _WIN32
+		DWORD hostLen = sizeof(host) - 1;
+		GetComputerNameA(host, &hostLen);
+#else
 		gethostname(host, sizeof(host) - 1);
 #endif
 		host[sizeof(host) - 1] = '\0';
@@ -308,7 +334,7 @@ Attrs OTelExt::BuildResource()
 	return a;
 }
 
-void OTelExt::EmitSlowTrace(uint64_t endNs, uint64_t durNs)
+void OTelExt::EmitSlowTrace(uint64_t endNs, uint64_t gameFrameNs, uint64_t tickCpuNs)
 {
 	uint64_t gap = 60000000000ULL / (uint64_t)std::max(1, g_cvSlowMaxPerMin->GetInt());
 	if (m_LastTraceNs && endNs - m_LastTraceNs < gap) {
@@ -317,23 +343,35 @@ void OTelExt::EmitSlowTrace(uint64_t endNs, uint64_t durNs)
 	}
 	m_LastTraceNs = endNs;
 
-	const char *version = SMEXT_CONF_VERSION;
-	TraceDoc doc(BuildResource(), version);
+	const std::vector<Span> &spans = m_Profiler.Spans();
+	bool haveSpans = m_ProfileOn && m_Profiler.FrameActive();
+
+	// The root covers the earliest callback of the window up to the end of GameFrame.
+	uint64_t rootStart = m_FrameStartNs;
+	if (haveSpans) {
+		for (const Span &s : spans) {
+			if (s.startNs && s.startNs < rootStart)
+				rootStart = s.startNs;
+		}
+	}
+	uint64_t wallEnd = WallNs();
+	auto toWall = [&](uint64_t mono) { return wallEnd - (endNs - mono); };
+
+	TraceDoc doc(BuildResource(), SMEXT_CONF_VERSION);
 
 	Attrs rootAttrs;
-	rootAttrs.Int("frame.duration_us", (int64_t)(durNs / 1000))
+	rootAttrs.Int("frame.cpu_us", (int64_t)(tickCpuNs / 1000))
+	         .Int("frame.gameframe_us", (int64_t)(gameFrameNs / 1000))
 	         .Int("players", playerhelpers->GetNumPlayers())
 	         .Int("entities", engine->GetEntityCount())
 	         .Str("map", STRING(gpGlobals->mapname))
-	         .Int("profiled", m_FrameProfiled ? 1 : 0);
-	if (m_FrameProfiled && m_Profiler.SpansTruncated())
+	         .Int("profiled", haveSpans ? 1 : 0);
+	if (haveSpans && m_Profiler.SpansTruncated())
 		rootAttrs.Int("spans.truncated", 1);
-	uint64_t rootId = doc.Span("GameFrame", 0, m_FrameWallNs, durNs, rootAttrs);
+	uint64_t rootId = doc.Span("ServerFrame", 0, toWall(rootStart), endNs - rootStart, rootAttrs);
 
-	if (m_FrameProfiled) {
-		const std::vector<Span> &spans = m_Profiler.Spans();
+	if (haveSpans) {
 		uint64_t minSpan = (uint64_t)g_cvMinSpanUs->GetInt() * 1000ULL;
-		uint64_t frameStart = m_Profiler.FrameStartNs();
 		std::vector<uint64_t> ids(spans.size(), 0);
 		size_t emitted = 0;
 
@@ -349,8 +387,7 @@ void OTelExt::EmitSlowTrace(uint64_t endNs, uint64_t durNs)
 			Attrs a;
 			a.Str("sm.plugin", s.stat->plugin.empty() ? "unknown" : s.stat->plugin.c_str())
 			 .Str("sm.function", s.stat->func.c_str());
-			uint64_t startWall = m_FrameWallNs + (s.startNs - frameStart);
-			ids[i] = doc.Span(s.stat->name.c_str(), parent, startWall, s.durNs, a);
+			ids[i] = doc.Span(s.stat->name.c_str(), parent, toWall(s.startNs), s.durNs, a);
 			emitted++;
 		}
 	}
@@ -362,7 +399,6 @@ void OTelExt::EmitSlowTrace(uint64_t endNs, uint64_t durNs)
 void OTelExt::Flush(uint64_t nowNs)
 {
 	m_NextFlushNs = nowNs + (uint64_t)g_cvInterval->GetInt() * 1000000000ULL;
-	m_LastFlushNs = nowNs;
 
 	// Report collector trouble once per outage, from the game thread.
 	std::string lastError = m_Exporter.LastError();
@@ -403,15 +439,19 @@ void OTelExt::Flush(uint64_t nowNs)
 		doc.SumDouble(callbackAttrs(s), s->selfNs / 1e6);
 	doc.End();
 
-	doc.BeginHistogram("source.frame.duration", "ms", "Time spent in one server frame (IServerGameDLL::GameFrame).");
+	doc.BeginHistogram("source.frame.duration", "ms", "Wall time of IServerGameDLL::GameFrame (SourceMod timers/forwards that run before it are not included, see source.tick.cpu_time).");
 	doc.Hist(none, m_FrameStat);
+	doc.End();
+
+	doc.BeginHistogram("source.tick.cpu_time", "ms", "CPU time of the main thread between two server frames (sleep excluded): the real cost of a tick.");
+	doc.Hist(none, m_TickCpuStat);
 	doc.End();
 
 	doc.BeginHistogram("source.frame.interval", "ms", "Time between two consecutive server frames.");
 	doc.Hist(none, m_IntervalStat);
 	doc.End();
 
-	doc.BeginSum("source.frame.slow", "{frame}", "Frames longer than sm_otel_slow_ms.");
+	doc.BeginSum("source.frame.slow", "{frame}", "Ticks whose CPU time or GameFrame time exceeded sm_otel_slow_ms.");
 	doc.SumDouble(none, (double)m_SlowFrames);
 	doc.End();
 
@@ -501,13 +541,17 @@ void OTelExt::PrintStatus()
 	META_CONPRINTF("sm-ext-otel %s\n", SMEXT_CONF_VERSION);
 	META_CONPRINTF("  enabled=%d profile=%d, plugin call hooks %s, profiling %s\n", g_cvEnable->GetInt(), g_cvProfile->GetInt(),
 		m_HookedFn ? "installed" : "NOT installed (no plugin loaded yet)", m_ProfileOn ? "on" : "off");
+	META_CONPRINTF("  hook hits: Execute %" PRIu64 ", Invoke %" PRIu64 ", Invoke(args) %" PRIu64 " (vtable idx %d/%d/%d)\n",
+		m_HookHits[0], m_HookHits[1], m_HookHits[2], m_VtblIdx[0], m_VtblIdx[1], m_VtblIdx[2]);
 	META_CONPRINTF("  endpoint %s, service '%s', every %ds\n", Endpoint().c_str(), g_cvService->GetString(), g_cvInterval->GetInt());
 	META_CONPRINTF("  callbacks tracked: %zu (exporting %zu), calls timed: %" PRIu64 "\n",
 		m_Profiler.Stats().size(), m_FlushedSeries, m_Profiler.ScopeCount());
 	META_CONPRINTF("  frames: %" PRIu64 ", slow: %" PRIu64 " (> %d ms), traces sent: %" PRIu64 ", rate-limited: %" PRIu64 "\n",
 		m_FrameStat.calls, m_SlowFrames, g_cvSlowMs->GetInt(), m_TracesSent, m_SlowSuppressed);
 	if (m_FrameStat.calls) {
-		META_CONPRINTF("  frame avg %.3f ms, max %.3f ms\n", m_FrameStat.totalNs / 1e6 / m_FrameStat.calls, m_FrameStat.maxNs / 1e6);
+		META_CONPRINTF("  GameFrame avg %.3f ms, max %.3f ms; tick cpu avg %.3f ms, max %.3f ms\n",
+			m_FrameStat.totalNs / 1e6 / m_FrameStat.calls, m_FrameStat.maxNs / 1e6,
+			m_TickCpuStat.calls ? m_TickCpuStat.totalNs / 1e6 / m_TickCpuStat.calls : 0.0, m_TickCpuStat.maxNs / 1e6);
 	}
 	META_CONPRINTF("  export: ok %" PRIu64 ", failed %" PRIu64 ", dropped %" PRIu64 ", %" PRIu64 " bytes\n",
 		m_Exporter.Sent(), m_Exporter.Failed(), m_Exporter.Dropped(), m_Exporter.BytesSent());

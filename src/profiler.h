@@ -19,6 +19,9 @@ inline uint64_t NowNs()
 		std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+// CPU time consumed by the calling thread (sleeping excluded).
+uint64_t ThreadCpuNs();
+
 inline uint64_t WallNs()
 {
 	return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -95,6 +98,7 @@ public:
 
 	void BeginFrame();
 	void EndFrame() { m_FrameActive = false; }
+	bool FrameActive() const { return m_FrameActive; }
 	const std::vector<Span> &Spans() const { return m_Spans; }
 	bool SpansTruncated() const { return m_SpansTruncated; }
 	uint64_t FrameStartNs() const { return m_FrameStart; }
